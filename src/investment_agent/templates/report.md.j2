@@ -46,13 +46,15 @@ Doğrulanamadı.
 | Katkılar / yatırmalar (USD) | {{ report.period_metrics.get("deposits_usd")|money }} |
 | Çekimler (USD) | {{ report.period_metrics.get("withdrawals_usd")|money }} |
 | Net dış nakit akışı (USD) | {{ report.period_metrics.get("net_external_flow_usd")|money }} |
-| Nakit akışından arındırılmış USD getirisi | {{ report.period_metrics.get("investment_return_pct")|pct }} |
+| Bağlantılı Modified Dietz / TWR USD getirisi | {{ report.period_metrics.get("investment_return_pct")|pct }} |
+| Tek dönem Modified Dietz kontrolü | {{ report.period_metrics.get("modified_dietz_return_pct")|pct }} |
 | TRY değer değişimi | {{ report.period_metrics.get("try_value_change_pct")|pct }} |
 | Maksimum düşüş | {{ report.period_metrics.get("maximum_drawdown_pct")|pct }} |
 | Yıllıklandırılmış oynaklık | {{ report.period_metrics.get("annualized_volatility_pct")|pct }} |
 {% if report.cadence.value == "monthly" %}| XIRR | {{ report.period_metrics.get("xirr_pct")|pct }} |{% endif %}
 
 Yeni yatırılan para yatırım performansı olarak sınıflandırılmaz. TRY satırı dış nakit akışından arındırılmış getiri değil, değer değişimidir. Yetersiz geçmiş bulunan ölçümler “—” gösterilir.
+Maksimum düşüş ve oynaklık ham portföy değerlerinden değil, nakit akışından arındırılmış bağlantılı dönem getirilerinden hesaplanır.
 
 ### Dönemsel ETF ve karşılaştırma göstergeleri
 
@@ -105,6 +107,7 @@ Alış veya satış kaydı bulunan bir varlığın dönem katkısı, nakit harek
 
 {% for event in report.events if event.event_type == "filing" %}
 - **{{ event.symbol }} {{ event.form or "form" }}:** [{{ event.title }}]({{ event.source.url }}) — accession {{ event.accession_number or "doğrulanamadı" }}, {{ event.occurred_at|dt }}
+- AI yorumu: **Atlandı.** Bu kayıt yalnız filing tespitidir; filing içeriği veya yapılandırılmış finansal olgu çıkarılmadan LLM'e gönderilmez.
 {% else %}
 Önceki başarılı çalışmadan sonra yeni SEC başvurusu bulunmadı.
 {% endfor %}
@@ -181,6 +184,14 @@ Makro göstergeler doğrulanamadı.
 ## AI yorumu durumu
 
 {% if report.ai_unavailable_reason %}AI yorumu kullanılamıyor: {{ report.ai_unavailable_reason }}{% else %}Şema ve kaynak doğrulamasından geçen AI yorumları yukarıda ayrı etiketlenmiştir.{% endif %}{{ "\n\n" -}}
+
+{% if report.analysis_dispositions %}
+| Olay kimliği | Durum | Açıklama |
+|---|---|---|
+{% for item in report.analysis_dispositions %}
+| {{ item.event_id }} | {{ item.status }} | {{ item.reason }} |
+{% endfor %}
+{% endif %}
 
 ---
 

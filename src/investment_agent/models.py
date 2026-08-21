@@ -156,6 +156,7 @@ class PositionValuation(BaseModel):
 
 class PortfolioSnapshot(BaseModel):
     as_of: datetime
+    market_session: date | None = None
     usdtry: float = Field(gt=0)
     total_value_usd: float = Field(ge=0)
     total_value_try: float = Field(ge=0)
@@ -170,6 +171,12 @@ class ProviderStatus(BaseModel):
     warning: str | None = None
 
 
+class AnalysisDisposition(BaseModel):
+    event_id: str
+    status: Literal["completed", "failed", "deferred", "skipped", "unavailable"]
+    reason: str
+
+
 class ReportContext(BaseModel):
     cadence: Cadence
     as_of: datetime
@@ -178,6 +185,7 @@ class ReportContext(BaseModel):
     snapshot: PortfolioSnapshot | None = None
     events: list[MaterialEvent] = Field(default_factory=list)
     analyses: list[AIEventAnalysis] = Field(default_factory=list)
+    analysis_dispositions: list[AnalysisDisposition] = Field(default_factory=list)
     macro: list[MacroObservation] = Field(default_factory=list)
     market_sources: list[SourceRecord] = Field(default_factory=list)
     market_quotes: list[PriceQuote] = Field(default_factory=list)

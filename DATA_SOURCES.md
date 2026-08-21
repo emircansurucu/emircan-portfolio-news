@@ -2,7 +2,7 @@
 
 | Alan | MVP kaynağı | Niteliği | Not |
 |---|---|---|---|
-| SEC formları | SEC EDGAR, EdgarTools | Birincil | 10-K, 10-Q, 8-K, Form 4, S-3 ve ilgili 424B formları |
+| SEC formları | SEC EDGAR, EdgarTools | Birincil | 10-K, 10-Q, 8-K, Form 4, S-3 ve ilgili 424B formları; şimdilik yalnız filing tespiti |
 | Şirket duyuruları | Yapılandırılmış resmî RSS/Atom | Birincil | HTML scraper yok; URL'yi IR sayfasından doğrulamak kullanıcı sorumluluğunda |
 | ABD makro | FRED API | Birincil/resmî dağıtım | CPIAUCSL, UNRATE, FEDFUNDS, DGS10 |
 | Hisse/ETF/endeks | Yahoo chart | Gecikmeli, resmî olmayan | MVP; lisanslı feed ile değiştirilmelidir |
@@ -14,6 +14,10 @@
 Henüz canlı adaptörü bulunmayan kapsam: TCMB/EVDS politika faizi ve USD/TRY, TÜİK Türkiye enflasyonu, doğrudan BLS/Federal Reserve, kurumsal kazanç/makro takvim, temettü/tax belge içe aktarımı, lisanslı gerçek zamanlı fiyat. Arayüzler yeni `MacroDataProvider`, `MarketDataProvider`, `FxProvider` uygulamalarını kabul eder.
 
 Fiyat sağlayıcı arızası raporu çökertmez; sayı “doğrulanamadı” olur. Her maddi kayıtta kaynak URL'si ile yayın/gözlem ve erişim zamanı gösterilir. Telifli haber tam metni state'e yazılmaz; başlık, kısa özet, URL, zaman, sınıflandırma ve hash saklanır.
+
+Yahoo sembolleri, resmî feed URL'leri, SEC şirketleri ve FRED serileri bağımsız hata sınırlarıdır. Bir scope başarısız olduğunda aynı batch içindeki başarılı kayıtlar korunur ve yalnız başarılı scope checkpoint'i ilerler. Uyarılar secret-safe biçimde rapora eklenir.
+
+SEC filing içeriği, XBRL/structured fact çıkarımı ve maddilik sınıflandırması henüz uygulanmadığından SEC detection kayıtlarına AI yorumu yapılmaz.
 
 Resmî başlangıç sayfaları, RSS/Atom adresi doğrulamak için:
 

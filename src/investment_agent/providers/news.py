@@ -11,6 +11,7 @@ from xml.etree import ElementTree
 import httpx
 
 from investment_agent.models import MaterialEvent, SourceRecord
+from investment_agent.providers.base import ProviderResult
 
 
 class OfficialFeedNewsProvider:
@@ -19,6 +20,14 @@ class OfficialFeedNewsProvider:
     def __init__(self, client: httpx.AsyncClient, feeds: dict[str, list[str]]) -> None:
         self.client = client
         self.feeds = feeds
+
+    @property
+    def scopes(self) -> list[str]:
+        return [
+            f"ir:{symbol}:{hashlib.sha256(url.encode()).hexdigest()[:12]}"
+            for symbol, urls in self.feeds.items()
+            for url in urls
+        ]
 
     @staticmethod
     def _text(element: ElementTree.Element, names: tuple[str, ...]) -> str | None:
@@ -87,12 +96,22 @@ class OfficialFeedNewsProvider:
 
     async def get_announcements(
         self, symbols: list[str], since: datetime | None
-    ) -> list[MaterialEvent]:
-        jobs = [
-            self._feed(symbol, url, since)
-            for symbol in symbols
-            for url in self.feeds.get(symbol, [])
-        ]
+    ) -> ProviderResult[list[MaterialEvent]]:
+        feed_specs = [(symbol, url) for symbol in symbols for url in self.feeds.get(symbol, [])]
+        jobs = [self._feed(symbol, url, since) for symbol, url in feed_specs]
         if not jobs:
-            return []
-        return [event for batch in await asyncio.gather(*jobs) for event in batch]
+            return ProviderResult([], warnings=["Hiçbir resmî IR feed yapılandırılmadı"])
+        results = await asyncio.gather(*jobs, return_exceptions=True)
+        events: list[MaterialEvent] = []
+        warnings: list[str] = []
+        successful_scopes: list[str] = []
+        for (symbol, url), result in zip(feed_specs, results, strict=True):
+            scope = f"ir:{symbol}:{hashlib.sha256(url.encode()).hexdigest()[:12]}"
+            if isinstance(result, BaseException):
+                warnings.append(
+                    f"{symbol}/{scope.rsplit(':', 1)[-1]}: {type(result).__name__} nedeniyle feed alınamadı"
+                )
+            else:
+                events.extend(result)
+                successful_scopes.append(scope)
+        return ProviderResult(events, warnings=warnings, successful_scopes=successful_scopes)

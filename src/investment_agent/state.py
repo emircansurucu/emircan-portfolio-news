@@ -4,19 +4,50 @@ import hashlib
 import json
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
-from investment_agent.models import Cadence, MaterialEvent, PortfolioSnapshot
+from investment_agent.models import (
+    AIEventAnalysis,
+    Cadence,
+    MaterialEvent,
+    PortfolioSnapshot,
+)
+
+AnalysisState = Literal["pending", "completed", "failed", "deferred", "skipped"]
 
 
 class StateRepository(Protocol):
     def last_success(self, cadence: Cadence) -> datetime | None: ...
 
+    def provider_checkpoint(self, scope: str) -> datetime | None: ...
+
     def is_processed(self, event: MaterialEvent, cadence: Cadence) -> bool: ...
 
     def history(self) -> list[dict[str, Any]]: ...
+
+    def unreported_events(
+        self, cadence: Cadence, since: datetime | None, earliest: datetime
+    ) -> list[MaterialEvent]: ...
+
+    def pending_analysis_events(self) -> list[MaterialEvent]: ...
+
+    def record_discovered(self, events: list[MaterialEvent], at: datetime) -> None: ...
+
+    def analysis_for(self, event: MaterialEvent) -> AIEventAnalysis | None: ...
+
+    def analysis_state(self, event: MaterialEvent) -> str: ...
+
+    def mark_analysis(
+        self,
+        event: MaterialEvent,
+        status: AnalysisState,
+        at: datetime,
+        *,
+        analysis: AIEventAnalysis | None = None,
+        reason: str | None = None,
+    ) -> None: ...
 
     def commit_success(
         self,
@@ -25,6 +56,17 @@ class StateRepository(Protocol):
         report_id: str,
         snapshot: PortfolioSnapshot | None,
         events: list[MaterialEvent],
+        provider_checkpoints: dict[str, datetime],
+    ) -> None: ...
+
+    def enqueue_delivery(
+        self, report_id: str, text: str, event_ids: list[str], at: datetime
+    ) -> None: ...
+
+    def pending_deliveries(self, at: datetime) -> list[dict[str, Any]]: ...
+
+    def mark_delivery(
+        self, report_id: str, *, success: bool, at: datetime, error: str | None = None
     ) -> None: ...
 
 
@@ -41,38 +83,79 @@ class JsonStateRepository:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
         self.state_path = data_dir / "state.json"
+        self.backup_path = data_dir / "state.json.bak"
         self.history_path = data_dir / "portfolio_history.jsonl"
         self.events_path = data_dir / "processed_events.jsonl"
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _default_state() -> dict[str, Any]:
+        return {
+            "version": 2,
+            "last_success": {},
+            "provider_checkpoints": {},
+            "processed_event_ids": [],
+            "reported_event_ids": {},
+            "event_lifecycle": {},
+            "outbox": [],
+            "reports": [],
+        }
+
+    @classmethod
+    def _migrate(cls, state: dict[str, Any]) -> dict[str, Any]:
+        defaults = cls._default_state()
+        for key, value in defaults.items():
+            state.setdefault(key, value)
+        state["version"] = 2
+        return state
+
     def _state(self) -> dict[str, Any]:
         if not self.state_path.exists():
-            return {
-                "version": 1,
-                "last_success": {},
-                "processed_event_ids": [],
-                "reported_event_ids": {},
-                "reports": [],
-            }
-        with self.state_path.open(encoding="utf-8") as handle:
-            return json.load(handle)
+            return self._default_state()
+        try:
+            with self.state_path.open(encoding="utf-8") as handle:
+                return self._migrate(json.load(handle))
+        except (json.JSONDecodeError, OSError) as primary_error:
+            if self.backup_path.exists():
+                try:
+                    with self.backup_path.open(encoding="utf-8") as handle:
+                        return self._migrate(json.load(handle))
+                except (json.JSONDecodeError, OSError):
+                    pass
+            raise RuntimeError(
+                "State dosyası ve yedeği okunamadı; otomatik sıfırlama yapılmadı"
+            ) from primary_error
 
     def last_success(self, cadence: Cadence) -> datetime | None:
-        raw = self._state().get("last_success", {}).get(cadence.value)
+        raw = self._state()["last_success"].get(cadence.value)
+        return datetime.fromisoformat(raw) if raw else None
+
+    def provider_checkpoint(self, scope: str) -> datetime | None:
+        raw = self._state()["provider_checkpoints"].get(scope)
         return datetime.fromisoformat(raw) if raw else None
 
     def is_processed(self, event: MaterialEvent, cadence: Cadence) -> bool:
-        reported = self._state().get("reported_event_ids", {}).get(cadence.value, [])
+        reported = self._state()["reported_event_ids"].get(cadence.value, [])
         return event_fingerprint(event) in set(reported)
 
     def history(self) -> list[dict[str, Any]]:
         if not self.history_path.exists():
             return []
+        rows: list[dict[str, Any]] = []
         with self.history_path.open(encoding="utf-8") as handle:
-            return [json.loads(line) for line in handle if line.strip()]
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Portfolio history bozuk JSONL satırı içeriyor: {line_number}"
+                    ) from exc
+        return rows
 
     @staticmethod
-    def _atomic_json(path: Path, payload: Any) -> None:
+    def _write_json(path: Path, payload: Any) -> None:
         descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -84,6 +167,17 @@ class JsonStateRepository:
         except BaseException:
             Path(name).unlink(missing_ok=True)
             raise
+
+    def _write_state(self, payload: dict[str, Any]) -> None:
+        if self.state_path.exists():
+            try:
+                with self.state_path.open(encoding="utf-8") as handle:
+                    previous = json.load(handle)
+                self._write_json(self.backup_path, previous)
+            except (json.JSONDecodeError, OSError):
+                # Preserve the last known-good backup when the primary is corrupt.
+                pass
+        self._write_json(self.state_path, payload)
 
     @staticmethod
     def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -99,6 +193,115 @@ class JsonStateRepository:
             Path(name).unlink(missing_ok=True)
             raise
 
+    def _event_rows(self) -> list[dict[str, Any]]:
+        if not self.events_path.exists():
+            return []
+        with self.events_path.open(encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def unreported_events(
+        self, cadence: Cadence, since: datetime | None, earliest: datetime
+    ) -> list[MaterialEvent]:
+        state = self._state()
+        reported = set(state["reported_event_ids"].get(cadence.value, []))
+        events: list[MaterialEvent] = []
+        for row in self._event_rows():
+            if row["fingerprint"] in reported:
+                continue
+            discovered_at = datetime.fromisoformat(row["discovered_at"])
+            event = MaterialEvent.model_validate(row["event"])
+            if (since and discovered_at > since) or (
+                since is None and event.occurred_at >= earliest
+            ):
+                events.append(event)
+        return events
+
+    def pending_analysis_events(self) -> list[MaterialEvent]:
+        state = self._state()
+        lifecycle = state["event_lifecycle"]
+        events: list[MaterialEvent] = []
+        for row in self._event_rows():
+            status = lifecycle.get(row["fingerprint"], {}).get("ai", {}).get("status", "pending")
+            if status in {"pending", "failed", "deferred"}:
+                events.append(MaterialEvent.model_validate(row["event"]))
+        return events
+
+    def record_discovered(self, events: list[MaterialEvent], at: datetime) -> None:
+        if not events:
+            return
+        state = self._state()
+        lifecycle = state["event_lifecycle"]
+        rows = self._event_rows()
+        row_by_id = {row["fingerprint"]: row for row in rows}
+        for event in events:
+            fingerprint = event_fingerprint(event)
+            entry = lifecycle.setdefault(
+                fingerprint,
+                {
+                    "event_id": event.event_id,
+                    "discovered_at": at.isoformat(),
+                    "reported": {},
+                    "ai": {"status": "pending", "attempts": 0},
+                    "deliveries": [],
+                },
+            )
+            entry["last_seen_at"] = at.isoformat()
+            row_by_id[fingerprint] = {
+                "fingerprint": fingerprint,
+                "event": event.model_dump(mode="json"),
+                "discovered_at": entry["discovered_at"],
+                "last_seen_at": at.isoformat(),
+            }
+        state["processed_event_ids"] = sorted(row_by_id)
+        self._atomic_jsonl(self.events_path, list(row_by_id.values()))
+        self._write_state(state)
+
+    def analysis_for(self, event: MaterialEvent) -> AIEventAnalysis | None:
+        entry = self._state()["event_lifecycle"].get(event_fingerprint(event), {})
+        ai = entry.get("ai", {})
+        if ai.get("status") != "completed" or not ai.get("analysis"):
+            return None
+        return AIEventAnalysis.model_validate(ai["analysis"])
+
+    def analysis_state(self, event: MaterialEvent) -> str:
+        entry = self._state()["event_lifecycle"].get(event_fingerprint(event), {})
+        return str(entry.get("ai", {}).get("status", "pending"))
+
+    def mark_analysis(
+        self,
+        event: MaterialEvent,
+        status: AnalysisState,
+        at: datetime,
+        *,
+        analysis: AIEventAnalysis | None = None,
+        reason: str | None = None,
+    ) -> None:
+        state = self._state()
+        fingerprint = event_fingerprint(event)
+        entry = state["event_lifecycle"].setdefault(
+            fingerprint,
+            {
+                "event_id": event.event_id,
+                "discovered_at": at.isoformat(),
+                "reported": {},
+                "ai": {"status": "pending", "attempts": 0},
+                "deliveries": [],
+            },
+        )
+        prior = entry.get("ai", {})
+        attempts = int(prior.get("attempts", 0)) + (1 if status in {"completed", "failed"} else 0)
+        ai_state: dict[str, Any] = {
+            "status": status,
+            "attempts": attempts,
+            "updated_at": at.isoformat(),
+        }
+        if analysis is not None:
+            ai_state["analysis"] = analysis.model_dump(mode="json")
+        if reason:
+            ai_state["reason"] = reason
+        entry["ai"] = ai_state
+        self._write_state(state)
+
     def commit_success(
         self,
         cadence: Cadence,
@@ -106,57 +309,125 @@ class JsonStateRepository:
         report_id: str,
         snapshot: PortfolioSnapshot | None,
         events: list[MaterialEvent],
+        provider_checkpoints: dict[str, datetime] | None = None,
     ) -> None:
         state = self._state()
-        identifiers = set(state.get("processed_event_ids", []))
+        identifiers = set(state["processed_event_ids"])
         identifiers.update(event_fingerprint(event) for event in events)
         state["processed_event_ids"] = sorted(identifiers)
-        reported_by_cadence = state.setdefault("reported_event_ids", {})
-        reported = set(reported_by_cadence.get(cadence.value, []))
-        reported.update(event_fingerprint(event) for event in events)
-        reported_by_cadence[cadence.value] = sorted(reported)
-        reports = state.setdefault("reports", [])
+        reported = set(state["reported_event_ids"].get(cadence.value, []))
+        for event in events:
+            fingerprint = event_fingerprint(event)
+            reported.add(fingerprint)
+            entry = state["event_lifecycle"].setdefault(
+                fingerprint,
+                {
+                    "event_id": event.event_id,
+                    "discovered_at": at.isoformat(),
+                    "reported": {},
+                    "ai": {"status": "pending", "attempts": 0},
+                    "deliveries": [],
+                },
+            )
+            entry["reported"][cadence.value] = at.isoformat()
+        state["reported_event_ids"][cadence.value] = sorted(reported)
+        state["provider_checkpoints"].update(
+            {
+                scope: timestamp.isoformat()
+                for scope, timestamp in (provider_checkpoints or {}).items()
+            }
+        )
+        reports = state["reports"]
         reports.append(
             {"report_id": report_id, "cadence": cadence.value, "created_at": at.isoformat()}
         )
         state["reports"] = reports[-1000:]
-        state.setdefault("last_success", {})[cadence.value] = at.isoformat()
+        state["last_success"][cadence.value] = at.isoformat()
 
         history = self.history()
         if snapshot is not None:
-            history.append(
-                {
-                    "as_of": snapshot.as_of.isoformat(),
-                    "total_value_usd": snapshot.total_value_usd,
-                    "total_value_try": snapshot.total_value_try,
-                    "usdtry": snapshot.usdtry,
-                    "market_prices_usd": snapshot.market_prices_usd,
-                    "position_values_usd": {
-                        position.symbol: position.value_usd for position in snapshot.positions
-                    },
-                    "report_id": report_id,
-                }
-            )
-        existing_events: list[dict[str, Any]] = []
-        if self.events_path.exists():
-            with self.events_path.open(encoding="utf-8") as handle:
-                existing_events = [json.loads(line) for line in handle if line.strip()]
-        existing_ids = {row["fingerprint"] for row in existing_events}
+            session = (snapshot.market_session or snapshot.as_of.date()).isoformat()
+            record = {
+                "market_session": session,
+                "as_of": snapshot.as_of.isoformat(),
+                "total_value_usd": snapshot.total_value_usd,
+                "total_value_try": snapshot.total_value_try,
+                "usdtry": snapshot.usdtry,
+                "market_prices_usd": snapshot.market_prices_usd,
+                "position_values_usd": {
+                    position.symbol: position.value_usd for position in snapshot.positions
+                },
+                "position_quantities": {
+                    position.symbol: position.quantity for position in snapshot.positions
+                },
+                "report_id": report_id,
+            }
+            history = [row for row in history if row.get("market_session") != session]
+            history.append(record)
+            history.sort(key=lambda row: str(row.get("market_session") or row["as_of"]))
+
+        self._atomic_jsonl(self.history_path, history)
+        event_rows = self._event_rows()
+        event_row_by_id = {row["fingerprint"]: row for row in event_rows}
         for event in events:
             fingerprint = event_fingerprint(event)
-            if fingerprint not in existing_ids:
-                existing_events.append(
-                    {
-                        "fingerprint": fingerprint,
-                        "event_id": event.event_id,
-                        "symbol": event.symbol,
-                        "title": event.title,
-                        "url": str(event.source.url),
-                        "occurred_at": event.occurred_at.isoformat(),
-                    }
-                )
+            event_row_by_id.setdefault(
+                fingerprint,
+                {
+                    "fingerprint": fingerprint,
+                    "event": event.model_dump(mode="json"),
+                    "discovered_at": at.isoformat(),
+                    "last_seen_at": at.isoformat(),
+                },
+            )
+        self._atomic_jsonl(self.events_path, list(event_row_by_id.values()))
+        self._write_state(state)
 
-        # Audit files are replaced atomically; state.json is the authoritative commit marker.
-        self._atomic_jsonl(self.history_path, history)
-        self._atomic_jsonl(self.events_path, existing_events)
-        self._atomic_json(self.state_path, state)
+    def enqueue_delivery(
+        self, report_id: str, text: str, event_ids: list[str], at: datetime
+    ) -> None:
+        state = self._state()
+        if any(item["report_id"] == report_id for item in state["outbox"]):
+            return
+        state["outbox"].append(
+            {
+                "report_id": report_id,
+                "text": text,
+                "event_ids": event_ids,
+                "status": "pending",
+                "attempts": 0,
+                "created_at": at.isoformat(),
+                "next_attempt_at": at.isoformat(),
+            }
+        )
+        self._write_state(state)
+
+    def pending_deliveries(self, at: datetime) -> list[dict[str, Any]]:
+        return [
+            item
+            for item in self._state()["outbox"]
+            if item["status"] != "delivered"
+            and datetime.fromisoformat(item["next_attempt_at"]) <= at
+        ]
+
+    def mark_delivery(
+        self, report_id: str, *, success: bool, at: datetime, error: str | None = None
+    ) -> None:
+        state = self._state()
+        item = next(entry for entry in state["outbox"] if entry["report_id"] == report_id)
+        item["attempts"] = int(item.get("attempts", 0)) + 1
+        if success:
+            item["status"] = "delivered"
+            item["delivered_at"] = at.isoformat()
+            for fingerprint in item.get("event_ids", []):
+                lifecycle = state["event_lifecycle"].get(fingerprint)
+                if lifecycle is not None:
+                    lifecycle.setdefault("deliveries", []).append(
+                        {"report_id": report_id, "delivered_at": at.isoformat()}
+                    )
+        else:
+            item["status"] = "failed"
+            item["last_error"] = (error or "delivery failed")[:300]
+            delay_minutes = min(2 ** min(item["attempts"], 10), 24 * 60)
+            item["next_attempt_at"] = (at + timedelta(minutes=delay_minutes)).isoformat()
+        self._write_state(state)

@@ -46,17 +46,33 @@ async def async_main(cadence: Cadence, dry_run: bool) -> int:
     if not portfolio_path.exists() and dry_run:
         portfolio_path = Path("portfolio.example.yaml")
     portfolio = load_portfolio(portfolio_path)
-    timeout = httpx.Timeout(settings.http_timeout_seconds)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        if dry_run:
-            market = FixtureMarketProvider()
-            metals = FixtureMetalsProvider()
-            fx = FixtureFxProvider()
-            sec = FixtureEventsProvider()
-            news = sec
-            macro = FixtureMacroProvider()
-            llm = None
-        else:
+    common = {
+        "portfolio": portfolio,
+        "state": JsonStateRepository(settings.data_dir),
+        "renderer": ReportRenderer(settings.reports_dir),
+        "timezone": settings.timezone,
+        "report_base_url": settings.report_base_url,
+        "max_llm_events_per_run": settings.max_llm_events_per_run,
+        "llm_max_concurrency": settings.llm_max_concurrency,
+        "llm_retry_attempts": settings.llm_retry_attempts,
+        "llm_retry_backoff_seconds": settings.llm_retry_backoff_seconds,
+    }
+    if dry_run:
+        # Do not construct httpx/OpenAI/live adapters: proxy variables cannot affect fixture mode.
+        events = FixtureEventsProvider()
+        agent = InvestmentAgent(
+            **common,
+            market=FixtureMarketProvider(),
+            metals=FixtureMetalsProvider(),
+            fx=FixtureFxProvider(),
+            sec=events,
+            news=events,
+            macro=FixtureMacroProvider(),
+        )
+        result = await agent.run(cadence, dry_run=True)
+    else:
+        timeout = httpx.Timeout(settings.http_timeout_seconds)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             market = YahooMarketDataProvider(client)
             metals = YahooPreciousMetalsProvider(market)
             fx = YahooFxProvider(market)
@@ -75,27 +91,25 @@ async def async_main(cadence: Cadence, dry_run: bool) -> int:
                 llm = OpenAILLMProvider(
                     settings.openai_api_key.get_secret_value(), settings.openai_model
                 )
-        delivery = None
-        if not dry_run and settings.telegram_bot_token and settings.telegram_chat_id:
-            delivery = TelegramDeliveryProvider(
-                client, settings.telegram_bot_token.get_secret_value(), settings.telegram_chat_id
+            delivery = None
+            if settings.telegram_bot_token and settings.telegram_chat_id:
+                delivery = TelegramDeliveryProvider(
+                    client,
+                    settings.telegram_bot_token.get_secret_value(),
+                    settings.telegram_chat_id,
+                )
+            agent = InvestmentAgent(
+                **common,
+                market=market,
+                metals=metals,
+                fx=fx,
+                sec=sec,
+                news=news,
+                macro=macro,
+                llm=llm,
+                delivery=delivery,
             )
-        agent = InvestmentAgent(
-            portfolio=portfolio,
-            state=JsonStateRepository(settings.data_dir),
-            renderer=ReportRenderer(settings.reports_dir),
-            market=market,
-            metals=metals,
-            fx=fx,
-            sec=sec,
-            news=news,
-            macro=macro,
-            llm=llm,
-            delivery=delivery,
-            timezone=settings.timezone,
-            report_base_url=settings.report_base_url,
-        )
-        result = await agent.run(cadence, dry_run=dry_run)
+            result = await agent.run(cadence)
     print(f"Markdown: {result.markdown_path}")
     print(f"HTML: {result.html_path}")
     if result.provider_failures:

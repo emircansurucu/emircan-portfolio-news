@@ -17,7 +17,11 @@ data/processed_events.jsonl     # telifli tam metin değil, olay meta verisi
 reports/                        # Markdown ve HTML
 ```
 
-`state.json` yetkili commit işaretidir. Başarısız rapor üretimi checkpoint'i değiştirmez. Kaynak geçici olarak başarısız olduğunda yedi günlük örtüşmeli yeniden tarama ve fingerprint tekilleştirmesi olası veri boşluğunu azaltır.
+`state.json` yetkili commit işaretidir. Başarısız rapor üretimi cadence veya provider checkpoint'ini değiştirmez. Her SEC şirketi, resmî IR feed'i, FRED serisi ve piyasa sembolünün başarılı checkpoint'i ayrıdır.
+
+Olay yaşam döngüsü keşfedildi, cadence bazında raporlandı, AI tamamlandı/başarısız/ertelendi/atlandı ve Telegram ile teslim edildi durumlarını ayrı saklar. Telegram mesajları kalıcı outbox üzerinden üstel gecikmeyle yeniden denenir. Bozuk `state.json`, otomatik sıfırlama yerine son bilinen sağlam `state.json.bak` üzerinden okunur.
+
+Portföy history'si her ABD piyasa seansı için en fazla bir kanonik gözlem taşır. Günlük, haftalık ve aylık çalıştırmalar aynı seansı yeniden append etmez. Dönem getirisi session aralıklarında Modified Dietz ile nakit akışından arındırılır ve geometrik bağlanarak TWR üretilir. Drawdown ve oynaklık ham portföy değerinden değil bu düzeltilmiş getiri serisinden hesaplanır.
 
 ## Kurulum
 
@@ -44,7 +48,7 @@ python -m investment_agent weekly
 python -m investment_agent monthly
 ```
 
-LLM anahtarı yoksa deterministik rapor yine üretilir; AI bölümü “kullanılamıyor” olarak işaretlenir. `--dry-run` sabit fixture kullanır, ağa çıkmaz, state değiştirmez ve Telegram göndermez.
+LLM anahtarı yoksa deterministik rapor yine üretilir; AI bölümü “kullanılamıyor” olarak işaretlenir. `--dry-run` sabit fixture kullanır, canlı HTTP/OpenAI sağlayıcısı oluşturmaz, proxy environment değişkenlerinden etkilenmez, ağa çıkmaz, state/checkpoint değiştirmez ve Telegram göndermez.
 
 ## Yapılandırma ve sırlar
 
@@ -58,6 +62,10 @@ LLM anahtarı yoksa deterministik rapor yine üretilir; AI bölümü “kullanı
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` | Kısa bildirim | Hayır |
 | `IR_FEEDS_JSON` | Sembol → yalnızca resmî RSS/Atom URL listesi | Duyurular için |
 | `REPORT_BASE_URL` | Telegram'daki tam rapor bağlantısının tabanı | Hayır |
+| `MAX_LLM_EVENTS_PER_RUN` | Çalıştırma başına AI olay üst sınırı; varsayılan 10 | Hayır |
+| `LLM_MAX_CONCURRENCY` | Eşzamanlı AI isteği; varsayılan 3 | Hayır |
+| `LLM_RETRY_ATTEMPTS` | Geçici AI hatası deneme sayısı; varsayılan 3 | Hayır |
+| `LLM_RETRY_BACKOFF_SECONDS` | Üstel retry taban gecikmesi; varsayılan 0.5 sn | Hayır |
 
 Kod bir model adı varsaymaz. `OPENAI_MODEL` değerini erişiminize, maliyet ve kalite tercihinize göre açıkça verin. Anthropic alanları ayrılmıştır fakat adaptörü henüz uygulanmamıştır.
 
@@ -83,6 +91,7 @@ Yeni bir varlık için YAML pozisyonunu ekleyin ve piyasa adaptörünün sembol 
 4. `REPORT_BASE_URL` yoksa mesaj repository içindeki rapor yolunu gösterir; herkese açık bağlantı üretmez.
 
 Telegram başarısızlığı tamamlanmış raporu veya checkpoint'i geri almaz. İstek URL'sindeki bot token hata kayıtlarına yazılmaz.
+Başarısız mesaj outbox'ta kalır ve sonraki uygun çalıştırmada yeniden denenir.
 
 ## GitHub Actions
 
@@ -102,6 +111,8 @@ Günlük canlı komut NYSE takvimini kontrol eder. Tatil/hafta sonunda normal fi
 - SEC kimliğinde gerçek iletişim bilgisi ve makul istek sıklığı kullanın.
 - FRED anahtarı ücretsiz olabilir fakat kota/koşullar sağlayıcıya aittir.
 - LLM yalnız yeni olaylar için çağrılır; maliyet seçilen modele ve olay sayısına bağlıdır.
+- Varsayılan AI bütçesi çalıştırma başına 10 olaydır; fazlası açıkça ertelenir.
+- SEC kayıtları gerçek filing içeriği veya yapılandırılmış olgular çıkarılana kadar yalnız “filing tespiti” olarak gösterilir ve LLM'e gönderilmez.
 - Kaynakların kapanış saatleri farklıdır. Rapor her kayıt için kaynak ve zaman damgası verir.
 - TCMB/EVDS, TÜİK, BLS/Federal Reserve doğrudan adaptörleri; kazanç/makro takvimi; lisanslı piyasa feed'i ve hedef takibi sonraki aşamadır.
 - VOO/QQQM resmî sayfaları HTML/RSS yapılarına göre `IR_FEEDS_JSON` ile bağlanmalıdır; varsayılan kırılgan scraper yoktur.
@@ -123,9 +134,10 @@ python -m investment_agent daily --dry-run
 - SEC çalışmıyor: `SEC_IDENTITY` biçimini ve EdgarTools sürümünü kontrol edin.
 - AI yok: hem anahtar hem model adı gerekir; deterministik çıktı etkilenmez.
 - Duyuru yok: resmî RSS/Atom URL'lerini `IR_FEEDS_JSON` içine koyun.
+- “Miktar değişti” uyarısı: quantity değişikliğine karşılık gelen tarihli `buy`/`sell` ve `quantity` kaydını ekleyin.
+- Telegram geçici olarak başarısız: outbox kaydı korunur ve daha sonra yeniden denenir.
 - GitHub push reddedildi: Actions için read/write workflow iznini ve branch protection kurallarını kontrol edin.
 
 ## Uyarı
 
 Bu sistem yalnızca bilgilendirme ve araştırma amaçlıdır; kişiselleştirilmiş yatırım tavsiyesi değildir. Üretilen hiçbir metin alım, satım veya tutma talimatı değildir. Finansal karar vermeden önce bütün verileri birincil kaynaklardan doğrulayın ve uygun profesyonel desteği değerlendirin.
-

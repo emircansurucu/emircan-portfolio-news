@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import httpx
 
 from investment_agent.models import PriceQuote, SourceRecord
+from investment_agent.providers.base import ProviderResult
 
 YAHOO_SYMBOLS = {
     "MSFT": "MSFT",
@@ -69,9 +70,20 @@ class YahooMarketDataProvider:
             ),
         )
 
-    async def get_quotes(self, symbols: list[str]) -> dict[str, PriceQuote]:
-        results = await asyncio.gather(*(self._quote(symbol) for symbol in symbols))
-        return {quote.symbol: quote for quote in results}
+    async def get_quotes(self, symbols: list[str]) -> ProviderResult[dict[str, PriceQuote]]:
+        results = await asyncio.gather(
+            *(self._quote(symbol) for symbol in symbols), return_exceptions=True
+        )
+        quotes: dict[str, PriceQuote] = {}
+        warnings: list[str] = []
+        successful_scopes: list[str] = []
+        for symbol, result in zip(symbols, results, strict=True):
+            if isinstance(result, BaseException):
+                warnings.append(f"{symbol}: {type(result).__name__} nedeniyle fiyat alınamadı")
+            else:
+                quotes[symbol] = result
+                successful_scopes.append(f"yahoo:{symbol}")
+        return ProviderResult(quotes, warnings=warnings, successful_scopes=successful_scopes)
 
 
 class YahooPreciousMetalsProvider:
@@ -80,7 +92,7 @@ class YahooPreciousMetalsProvider:
     def __init__(self, market: YahooMarketDataProvider) -> None:
         self.market = market
 
-    async def get_metals(self) -> dict[str, PriceQuote]:
+    async def get_metals(self) -> ProviderResult[dict[str, PriceQuote]]:
         return await self.market.get_quotes(["GOLD", "SILVER"])
 
 
@@ -91,4 +103,7 @@ class YahooFxProvider:
         self.market = market
 
     async def get_usdtry(self) -> PriceQuote:
-        return (await self.market.get_quotes(["USDTRY"]))["USDTRY"]
+        result = await self.market.get_quotes(["USDTRY"])
+        if "USDTRY" not in result.data:
+            raise RuntimeError(result.warnings[0] if result.warnings else "USD/TRY alınamadı")
+        return result.data["USDTRY"]

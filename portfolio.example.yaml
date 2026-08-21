@@ -33,7 +33,7 @@ positions:
     asset_type: precious_metal
     quantity: 400
     unit: gram
-transactions:
+transactions: []
   # Gelecekteki nakit hareketi örneği:
   # - date: 2026-01-15
   #   type: deposit

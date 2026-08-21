@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 from datetime import date, datetime
+from itertools import pairwise
 
 import numpy as np
 import pandas as pd
@@ -110,12 +111,36 @@ def investment_return(
     return (end_value - begin_value - net_external_flow) / begin_value
 
 
+def modified_dietz_return(
+    begin_value: float,
+    end_value: float,
+    period_start: date,
+    period_end: date,
+    cash_flows: Sequence[tuple[date, float]],
+) -> float | None:
+    """Cash-flow-aware period return; owner contributions are positive flows."""
+    if begin_value <= 0 or period_end <= period_start:
+        return None
+    duration = (period_end - period_start).days
+    weighted_flows = 0.0
+    net_flows = 0.0
+    for flow_date, amount in cash_flows:
+        if period_start < flow_date <= period_end:
+            weight = (period_end - flow_date).days / duration
+            weighted_flows += weight * amount
+            net_flows += amount
+    denominator = begin_value + weighted_flows
+    if denominator <= 0:
+        return None
+    return (end_value - begin_value - net_flows) / denominator
+
+
 def maximum_drawdown(values: Sequence[float]) -> float | None:
     if not values:
         return None
     series = np.asarray(values, dtype=float)
-    if np.any(series <= 0):
-        raise ValueError("Portfolio values must be positive")
+    if np.any(series < 0):
+        raise ValueError("Portfolio values cannot be negative")
     peaks = np.maximum.accumulate(series)
     return float(np.min(series / peaks - 1.0))
 
@@ -125,6 +150,76 @@ def annualized_volatility(values: Sequence[float], periods: int = 252) -> float 
         return None
     returns = pd.Series(values, dtype=float).pct_change().dropna()
     return float(qs.stats.volatility(returns, periods=periods, annualize=True))
+
+
+def annualized_return_volatility(returns: Sequence[float], periods: int = 252) -> float | None:
+    if len(returns) < 2:
+        return None
+    return float(
+        qs.stats.volatility(pd.Series(returns, dtype=float), periods=periods, annualize=True)
+    )
+
+
+def linked_modified_dietz_returns(
+    records: Sequence[dict[str, object]], transactions: Sequence[Transaction]
+) -> list[float]:
+    """Link cash-flow-adjusted session returns for TWR/risk analytics."""
+    ordered = sorted(records, key=_history_date)
+    external = [
+        (
+            transaction.date,
+            transaction.amount_usd or 0.0
+            if transaction.type is TransactionType.DEPOSIT
+            else -(transaction.amount_usd or 0.0),
+        )
+        for transaction in transactions
+        if transaction.type in {TransactionType.DEPOSIT, TransactionType.WITHDRAWAL}
+    ]
+    returns: list[float] = []
+    for previous, current in pairwise(ordered):
+        start = _history_date(previous)
+        end = _history_date(current)
+        result = modified_dietz_return(
+            float(previous["total_value_usd"]),
+            float(current["total_value_usd"]),
+            start,
+            end,
+            external,
+        )
+        if result is not None:
+            returns.append(result)
+    return returns
+
+
+def _history_date(record: dict[str, object]) -> date:
+    market_session = record.get("market_session")
+    if market_session:
+        return date.fromisoformat(str(market_session))
+    return pd.Timestamp(record["as_of"]).date()
+
+
+def quantity_change_warnings(
+    previous_quantities: dict[str, float],
+    current_quantities: dict[str, float],
+    transactions: Sequence[Transaction],
+    *,
+    tolerance: float = 1e-6,
+) -> list[str]:
+    warnings: list[str] = []
+    for symbol in sorted(set(previous_quantities) | set(current_quantities)):
+        actual_change = current_quantities.get(symbol, 0.0) - previous_quantities.get(symbol, 0.0)
+        recorded_change = sum(
+            (transaction.quantity or 0.0) * (1 if transaction.type is TransactionType.BUY else -1)
+            for transaction in transactions
+            if transaction.symbol == symbol
+            and transaction.type in {TransactionType.BUY, TransactionType.SELL}
+        )
+        if abs(actual_change - recorded_change) > tolerance:
+            warnings.append(
+                f"{symbol} miktarı {actual_change:+.6f} değişti; işlem kayıtlarının neti "
+                f"{recorded_change:+.6f}. Alış/satış kaydı eksik olabilir."
+            )
+    return warnings
 
 
 def xirr(cash_flows: Sequence[tuple[date, float]], guess: float = 0.1) -> float | None:
@@ -165,6 +260,7 @@ def history_metrics(
 ) -> dict[str, float | None]:
     if not records:
         return {}
+    records = sorted(records, key=_history_date)
     frame = pd.DataFrame(records)
     frame["as_of"] = pd.to_datetime(frame["as_of"], utc=True)
     frame = frame.sort_values("as_of")
@@ -180,6 +276,31 @@ def history_metrics(
         transaction.amount_usd or 0.0
         for transaction in transactions
         if transaction.type is TransactionType.WITHDRAWAL
+    )
+    adjusted_returns = linked_modified_dietz_returns(records, transactions)
+    twr = (
+        float(np.prod([1.0 + value for value in adjusted_returns]) - 1.0)
+        if adjusted_returns
+        else None
+    )
+    wealth_index = [1.0]
+    for period_return in adjusted_returns:
+        wealth_index.append(wealth_index[-1] * (1.0 + period_return))
+    whole_period_dietz = modified_dietz_return(
+        begin,
+        end,
+        _history_date(records[0]),
+        _history_date(records[-1]),
+        [
+            (
+                transaction.date,
+                transaction.amount_usd or 0.0
+                if transaction.type is TransactionType.DEPOSIT
+                else -(transaction.amount_usd or 0.0),
+            )
+            for transaction in transactions
+            if transaction.type in {TransactionType.DEPOSIT, TransactionType.WITHDRAWAL}
+        ],
     )
     metrics: dict[str, float | None] = {
         "begin_value_usd": begin,
@@ -201,19 +322,18 @@ def history_metrics(
             )
             for transaction in transactions
         ),
-        "investment_return_pct": (
-            investment_return(begin, end, flow) * 100
-            if len(records) >= 2 and investment_return(begin, end, flow) is not None
-            else None
+        "investment_return_pct": twr * 100 if twr is not None else None,
+        "modified_dietz_return_pct": (
+            whole_period_dietz * 100 if whole_period_dietz is not None else None
         ),
         "maximum_drawdown_pct": (
-            maximum_drawdown(values) * 100
-            if len(records) >= 2 and maximum_drawdown(values) is not None
+            maximum_drawdown(wealth_index) * 100
+            if len(adjusted_returns) >= 1 and maximum_drawdown(wealth_index) is not None
             else None
         ),
         "annualized_volatility_pct": (
-            annualized_volatility(values) * 100
-            if annualized_volatility(values) is not None
+            annualized_return_volatility(adjusted_returns) * 100
+            if annualized_return_volatility(adjusted_returns) is not None
             else None
         ),
     }
@@ -232,20 +352,36 @@ def history_metrics(
                 ) * 100
     first_values = records[0].get("position_values_usd", {})
     last_values = records[-1].get("position_values_usd", {})
-    traded_symbols = {
-        transaction.symbol
-        for transaction in transactions
-        if transaction.type in {TransactionType.BUY, TransactionType.SELL}
-    }
     if len(records) >= 2 and isinstance(first_values, dict) and isinstance(last_values, dict):
         for symbol in set(first_values) & set(last_values):
-            if symbol not in traded_symbols and begin > 0:
+            trade_cash = sum(
+                (
+                    (
+                        transaction.amount_usd
+                        or (transaction.quantity or 0.0) * (transaction.price_usd or 0.0)
+                    )
+                    * (1 if transaction.type is TransactionType.BUY else -1)
+                )
+                for transaction in transactions
+                if transaction.symbol == symbol
+                and transaction.type in {TransactionType.BUY, TransactionType.SELL}
+            )
+            incomplete_trade = any(
+                transaction.symbol == symbol
+                and transaction.type in {TransactionType.BUY, TransactionType.SELL}
+                and transaction.amount_usd is None
+                and (transaction.quantity is None or transaction.price_usd is None)
+                for transaction in transactions
+            )
+            if not incomplete_trade and begin > 0:
                 metrics[f"period_{symbol}_contribution_pct"] = (
-                    (float(last_values[symbol]) - float(first_values[symbol])) / begin * 100
+                    (float(last_values[symbol]) - float(first_values[symbol]) - trade_cash)
+                    / begin
+                    * 100
                 )
     if cadence == "monthly":
-        origin = frame.iloc[0]["as_of"].date()
-        end_date = frame.iloc[-1]["as_of"].date()
+        origin = _history_date(records[0])
+        end_date = _history_date(records[-1])
         dated_flows = [(origin, -begin)]
         dated_flows.extend(
             (

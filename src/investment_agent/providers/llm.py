@@ -5,6 +5,7 @@ import json
 from pydantic import ValidationError
 
 from investment_agent.models import AIEventAnalysis, MaterialEvent
+from investment_agent.providers.base import NonRetryableLLMError
 
 SYSTEM_PROMPT = """Sen Türkçe yazan bir yatırım araştırma asistanısın.
 Kurallar:
@@ -75,4 +76,6 @@ class OpenAILLMProvider:
                 return analysis
             except (ValidationError, ValueError, json.JSONDecodeError) as exc:
                 last_error = exc
-        raise RuntimeError("LLM output failed schema/provenance validation twice") from last_error
+        raise NonRetryableLLMError(
+            "LLM output failed schema/provenance validation twice"
+        ) from last_error

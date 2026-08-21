@@ -8,6 +8,6 @@ reports/*.html
 reports/*.md
 !reports/.gitkeep
 data/state.json
+data/state.json.bak
 data/portfolio_history.jsonl
 data/processed_events.jsonl
-

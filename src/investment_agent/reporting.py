@@ -2,13 +2,98 @@ from __future__ import annotations
 
 import os
 import tempfile
+from html import escape
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import markdown as markdown_converter
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
 
 from investment_agent.models import ReportContext
+
+ALLOWED_TAGS = {
+    "a",
+    "blockquote",
+    "br",
+    "code",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "strong",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+}
+VOID_TAGS = {"br", "hr"}
+
+
+class _HTMLSanitizer(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.blocked_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "iframe", "object"}:
+            self.blocked_depth += 1
+            return
+        if self.blocked_depth or tag not in ALLOWED_TAGS:
+            return
+        safe_attrs: list[str] = []
+        for name, value in attrs:
+            name = name.lower()
+            value = value or ""
+            if tag == "a" and name in {"href", "title"}:
+                if name == "href" and urlsplit(value).scheme not in {"http", "https"}:
+                    continue
+                safe_attrs.append(f' {name}="{escape(value, quote=True)}"')
+            elif (
+                tag in {"th", "td"}
+                and name == "style"
+                and value
+                in {
+                    "text-align: left;",
+                    "text-align: right;",
+                    "text-align: center;",
+                }
+            ):
+                safe_attrs.append(f' style="{value}"')
+        self.parts.append(f"<{tag}{''.join(safe_attrs)}>")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"script", "style", "iframe", "object"}:
+            self.blocked_depth = max(0, self.blocked_depth - 1)
+            return
+        if not self.blocked_depth and tag in ALLOWED_TAGS and tag not in VOID_TAGS:
+            self.parts.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self.blocked_depth:
+            self.parts.append(escape(data))
+
+
+def sanitize_html(value: str) -> str:
+    sanitizer = _HTMLSanitizer()
+    sanitizer.feed(value)
+    sanitizer.close()
+    return "".join(sanitizer.parts)
 
 
 class ReportRenderer:
@@ -44,7 +129,7 @@ class ReportRenderer:
         markdown = self.environment.get_template("report.md.j2").render(report=context)
         body = markdown_converter.markdown(markdown, extensions=["tables"])
         html = self.environment.get_template("report.html.j2").render(
-            report=context, body=Markup(body)
+            report=context, body=Markup(sanitize_html(body))
         )
         markdown_path = self.reports_dir / f"{context.report_id}.md"
         html_path = self.reports_dir / f"{context.report_id}.html"

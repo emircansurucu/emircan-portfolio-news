@@ -30,6 +30,6 @@ async def test_yahoo_http_is_mocked():
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        quote = (await YahooMarketDataProvider(client).get_quotes(["MSFT"]))["MSFT"]
+        quote = (await YahooMarketDataProvider(client).get_quotes(["MSFT"])).data["MSFT"]
     assert quote.price_usd == 420
     assert quote.daily_return == pytest.approx(420 / 410 - 1)

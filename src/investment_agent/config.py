@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     report_base_url: str | None = None
     timezone: str = "Europe/Istanbul"
     http_timeout_seconds: float = Field(default=20.0, gt=0)
+    max_llm_events_per_run: int = Field(default=10, ge=0, le=100)
+    llm_max_concurrency: int = Field(default=3, ge=1, le=20)
+    llm_retry_attempts: int = Field(default=3, ge=1, le=6)
+    llm_retry_backoff_seconds: float = Field(default=0.5, ge=0, le=30)
 
     @field_validator("llm_provider")
     @classmethod

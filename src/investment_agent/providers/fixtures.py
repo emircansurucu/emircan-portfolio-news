@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from investment_agent.models import MacroObservation, MaterialEvent, PriceQuote, SourceRecord
+from investment_agent.providers.base import ProviderResult
 
 FIXTURE_PRICES = {
     "MSFT": (428.50, 425.20),
@@ -42,8 +43,11 @@ def fixture_quote(symbol: str, now: datetime | None = None) -> PriceQuote:
 class FixtureMarketProvider:
     name = "Çevrimdışı fixture"
 
-    async def get_quotes(self, symbols: list[str]) -> dict[str, PriceQuote]:
-        return {symbol: fixture_quote(symbol) for symbol in symbols}
+    async def get_quotes(self, symbols: list[str]) -> ProviderResult[dict[str, PriceQuote]]:
+        return ProviderResult(
+            {symbol: fixture_quote(symbol) for symbol in symbols},
+            successful_scopes=[f"fixture:{symbol}" for symbol in symbols],
+        )
 
 
 class FixtureFxProvider:
@@ -56,41 +60,49 @@ class FixtureFxProvider:
 class FixtureMetalsProvider:
     name = "Çevrimdışı fixture"
 
-    async def get_metals(self) -> dict[str, PriceQuote]:
-        return {symbol: fixture_quote(symbol) for symbol in ("GOLD", "SILVER")}
+    async def get_metals(self) -> ProviderResult[dict[str, PriceQuote]]:
+        return ProviderResult(
+            {symbol: fixture_quote(symbol) for symbol in ("GOLD", "SILVER")},
+            successful_scopes=["fixture:GOLD", "fixture:SILVER"],
+        )
 
 
 class FixtureMacroProvider:
     name = "Çevrimdışı fixture"
 
-    async def get_observations(self) -> list[MacroObservation]:
+    async def get_observations(self) -> ProviderResult[list[MacroObservation]]:
         now = datetime.now(UTC)
-        return [
-            MacroObservation(
-                series_id="DGS10",
-                name_tr="ABD 10 yıllık Hazine tahvili getirisi",
-                value=4.21,
-                unit="%",
-                observed_at=now,
-                source=SourceRecord(
-                    title="Çevrimdışı test verisi: DGS10",
-                    url="https://example.invalid/fixtures/DGS10",
-                    published_at=now,
-                    retrieved_at=now,
-                    provider=self.name,
-                    is_primary=False,
-                ),
-            )
-        ]
+        return ProviderResult(
+            [
+                MacroObservation(
+                    series_id="DGS10",
+                    name_tr="ABD 10 yıllık Hazine tahvili getirisi",
+                    value=4.21,
+                    unit="%",
+                    observed_at=now,
+                    source=SourceRecord(
+                        title="Çevrimdışı test verisi: DGS10",
+                        url="https://example.invalid/fixtures/DGS10",
+                        published_at=now,
+                        retrieved_at=now,
+                        provider=self.name,
+                        is_primary=False,
+                    ),
+                )
+            ],
+            successful_scopes=["fixture:DGS10"],
+        )
 
 
 class FixtureEventsProvider:
     name = "Çevrimdışı fixture"
 
-    async def get_filings(self, symbols: list[str], since: datetime | None) -> list[MaterialEvent]:
-        return []
+    async def get_filings(
+        self, symbols: list[str], since: datetime | None
+    ) -> ProviderResult[list[MaterialEvent]]:
+        return ProviderResult([], successful_scopes=[f"fixture:sec:{symbol}" for symbol in symbols])
 
     async def get_announcements(
         self, symbols: list[str], since: datetime | None
-    ) -> list[MaterialEvent]:
-        return []
+    ) -> ProviderResult[list[MaterialEvent]]:
+        return ProviderResult([], successful_scopes=["fixture:ir"])
