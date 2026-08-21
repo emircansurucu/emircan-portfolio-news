@@ -1,0 +1,187 @@
+# {{ report.cadence.value|upper }} Yatırım Araştırma Raporu
+
+- Rapor türü: {{ report.cadence.value }}
+- Rapor tarihi (Europe/Istanbul): {{ report.as_of|dt }}
+- Piyasa verisi tarihi: {{ report.market_data_at|dt }}
+- Önceki başarılı çalışmadan itibaren: {{ report.since|dt }}
+- Başarılı sağlayıcılar: {% for p in report.providers if p.success %}{{ p.provider }}{% if not loop.last %}, {% endif %}{% else %}Yok{% endfor %}{{ "\n" -}}
+- Başarısız sağlayıcılar: {% for p in report.providers if not p.success %}{{ p.provider }}{% if p.warning %} ({{ p.warning }}){% endif %}{% if not loop.last %}, {% endif %}{% else %}Yok{% endfor %}{{ "\n\n" -}}
+
+{% if report.freshness_warnings %}
+## Veri tazeliği uyarıları
+
+{% for warning in report.freshness_warnings %}
+- {{ warning }}
+{% endfor %}
+{% endif %}
+
+## 1. Yönetici özeti
+
+{% if report.snapshot %}
+Portföyün doğrulanmış fiyat girdileriyle hesaplanan değeri **${{ report.snapshot.total_value_usd|money }}** ve **₺{{ report.snapshot.total_value_try|money }}**. Günlük değişim {{ report.snapshot.daily_return_pct|pct }}.
+{% else %}
+Portföy değeri gerekli fiyat veya döviz verileri eksik olduğu için **doğrulanamadı**.
+{% endif %}
+Bu raporda önceki başarılı {{ report.cadence.value }} çalışmadan sonra bulunan {{ report.events|length }} yeni olay bulunuyor.
+
+## 2. Portföy değeri ve varlık katkıları
+
+{% if report.snapshot %}
+| Varlık | Tür | Miktar | Fiyat (USD) | Değer (USD) | Değer (TRY) | Ağırlık | Günlük katkı |
+|---|---|---:|---:|---:|---:|---:|---:|
+{% for p in report.snapshot.positions %}
+| {{ p.symbol }} | {{ p.asset_type.value }} | {{ "%.4f"|format(p.quantity) }} | {{ p.price_usd|money }} | {{ p.value_usd|money }} | {{ p.value_try|money }} | {{ (p.weight * 100)|pct }} | {{ p.daily_contribution_pct|pct }} |
+{% endfor %}
+{% else %}
+Doğrulanamadı.
+{% endif %}
+
+{% if report.cadence.value != "daily" %}
+## 3. Dönem performansı ve risk ölçümleri
+
+| Ölçüm | Değer |
+|---|---:|
+| Başlangıç değeri (USD) | {{ report.period_metrics.get("begin_value_usd")|money }} |
+| Bitiş değeri (USD) | {{ report.period_metrics.get("end_value_usd")|money }} |
+| Katkılar / yatırmalar (USD) | {{ report.period_metrics.get("deposits_usd")|money }} |
+| Çekimler (USD) | {{ report.period_metrics.get("withdrawals_usd")|money }} |
+| Net dış nakit akışı (USD) | {{ report.period_metrics.get("net_external_flow_usd")|money }} |
+| Nakit akışından arındırılmış USD getirisi | {{ report.period_metrics.get("investment_return_pct")|pct }} |
+| TRY değer değişimi | {{ report.period_metrics.get("try_value_change_pct")|pct }} |
+| Maksimum düşüş | {{ report.period_metrics.get("maximum_drawdown_pct")|pct }} |
+| Yıllıklandırılmış oynaklık | {{ report.period_metrics.get("annualized_volatility_pct")|pct }} |
+{% if report.cadence.value == "monthly" %}| XIRR | {{ report.period_metrics.get("xirr_pct")|pct }} |{% endif %}
+
+Yeni yatırılan para yatırım performansı olarak sınıflandırılmaz. TRY satırı dış nakit akışından arındırılmış getiri değil, değer değişimidir. Yetersiz geçmiş bulunan ölçümler “—” gösterilir.
+
+### Dönemsel ETF ve karşılaştırma göstergeleri
+
+| Gösterge | Dönem fiyat değişimi |
+|---|---:|
+| VOO | {{ report.period_metrics.get("period_VOO_return_pct")|pct }} |
+| S&P 500 | {{ report.period_metrics.get("period_SP500_return_pct")|pct }} |
+| QQQM | {{ report.period_metrics.get("period_QQQM_return_pct")|pct }} |
+| Nasdaq-100 | {{ report.period_metrics.get("period_NASDAQ100_return_pct")|pct }} |
+
+### Dönemsel varlık katkısı
+
+| Varlık | Katkı (yüzde puan) |
+|---|---:|
+{% if report.snapshot %}
+{% for position in report.snapshot.positions %}
+| {{ position.symbol }} | {{ report.period_metrics.get("period_" ~ position.symbol ~ "_contribution_pct")|pct }} |
+{% endfor %}
+{% else %}
+| Doğrulanamadı | — |
+{% endif %}
+
+Alış veya satış kaydı bulunan bir varlığın dönem katkısı, nakit hareketiyle piyasa etkisini karıştırmamak için “—” gösterilir.
+{% endif %}
+
+## 4. Yeni doğrulanmış şirket gelişmeleri
+
+{% for event in report.events if event.event_type != "filing" %}
+### {{ event.symbol }} — {{ event.title }}
+
+- Doğrulanmış bilgi: {{ event.summary or "Kaynakta başlık dışında kısa özet bulunmuyor." }}
+- Olay zamanı: {{ event.occurred_at|dt }}
+- Tür: {{ event.event_type }}
+- Birincil kaynak: {{ "Evet" if event.source.is_primary else "Hayır" }}
+- Kaynak: [{{ event.source.title }}]({{ event.source.url }}) (erişim: {{ event.source.retrieved_at|dt }})
+{% set analysis = report.analyses|selectattr("event_id", "equalto", event.event_id)|first %}
+{% if analysis %}
+- {{ analysis.interpretation_tr }}
+- {{ analysis.possible_portfolio_relevance_tr }}
+- Önem / güven: {{ analysis.materiality }} / {{ analysis.confidence }}
+- Belirsizlikler: {{ analysis.uncertainties|join("; ") if analysis.uncertainties else "Belirtilmedi" }}
+{% else %}
+- AI yorumu: Kullanılamıyor; doğrulanmış olgu korunmuştur.
+{% endif %}
+{% else %}
+Önceki başarılı çalışmadan sonra yeni ve doğrulanmış şirket duyurusu bulunmadı.
+{% endfor %}
+
+## 5. Yeni SEC başvuruları
+
+{% for event in report.events if event.event_type == "filing" %}
+- **{{ event.symbol }} {{ event.form or "form" }}:** [{{ event.title }}]({{ event.source.url }}) — accession {{ event.accession_number or "doğrulanamadı" }}, {{ event.occurred_at|dt }}
+{% else %}
+Önceki başarılı çalışmadan sonra yeni SEC başvurusu bulunmadı.
+{% endfor %}
+
+## 6. ETF, karşılaştırma göstergeleri, altın, gümüş ve USD/TRY
+
+| Gösterge | Değer | Günlük değişim | Veri zamanı | Kaynak |
+|---|---:|---:|---|---|
+{% for quote in report.market_quotes %}
+| {{ quote.symbol }} | {{ quote.price_usd|money }} | {{ ((quote.daily_return or 0) * 100)|pct if quote.daily_return is not none else "—" }} | {{ quote.as_of|dt }} | [{{ quote.source.provider }}]({{ quote.source.url }}) |
+{% else %}
+| Doğrulanamadı | — | — | — | — |
+{% endfor %}
+
+Altın ve gümüş değerleri USD/gram, USD/TRY değeri TRY/USD, diğer satırlar ilgili piyasa kotasyon birimindedir.
+
+## 7. Makro görünüm
+
+{% for item in report.macro %}
+- {{ item.name_tr }}: **{{ item.value }} {{ item.unit }}** — [{{ item.source.title }}]({{ item.source.url }}), gözlem {{ item.observed_at|dt }}, erişim {{ item.source.retrieved_at|dt }}
+{% else %}
+Makro göstergeler doğrulanamadı.
+{% endfor %}
+
+## 8. Yaklaşan önemli olaylar ve izleme listesi
+
+{% for item in report.upcoming_events %}
+- {{ item }}
+{% else %}
+- Takvim sağlayıcısı yapılandırılmadı; yaklaşan olaylar doğrulanamadı.
+{% endfor %}
+
+## 9. İzlenmesi gereken riskler
+
+- Gecikmeli/resmî olmayan piyasa verileri, lisanslı gerçek zamanlı fiyat yerine kullanılıyor olabilir.
+- Eksik sağlayıcılar ve güncellik farkları rapor başındaki durum alanında gösterilir.
+- Kur, emtia ve menkul kıymet fiyatları farklı piyasa kapanış anlarına ait olabilir.
+
+{% if report.cadence.value == "weekly" and report.analyses %}
+### Haftalık tez-etki tablosu
+
+| Varlık | Önem | Güven | Yatırım tezini etkileyebilecek gelişme |
+|---|---|---|---|
+{% for analysis in report.analyses %}
+| {{ analysis.symbol }} | {{ analysis.materiality }} | {{ analysis.confidence }} | {{ analysis.possible_portfolio_relevance_tr }} |
+{% endfor %}
+{% endif %}
+
+{% if report.cadence.value == "monthly" %}
+## Aylık kayıt, dağılım ve tez kontrolü
+
+- Varlık sınıfı dağılımı: bireysel hisseler {{ report.period_metrics.get("allocation_stock_pct")|pct }}, ETF {{ report.period_metrics.get("allocation_etf_pct")|pct }}, değerli metaller {{ report.period_metrics.get("allocation_precious_metal_pct")|pct }}.
+- Dönem temettüleri: ${{ report.period_metrics.get("dividends_usd")|money }}; komisyonlar: ${{ report.period_metrics.get("commissions_usd")|money }}.
+- Temettü, komisyon ve vergisel kayıtların aracı kurum belgeleriyle mutabakatını yapın.
+- Boğa senaryosu, ayı senaryosu ve temel belirsizlikler yalnızca yeni doğrulanmış gelişmeler ışığında yeniden değerlendirilmelidir.
+- Boğa senaryosu: Ayrı ve doğrulanmış bir senaryo girdisi bulunmadığından **doğrulanamadı**; olumlu AI çıkarımı olgu değildir.
+- Ayı senaryosu: Ayrı ve doğrulanmış bir senaryo girdisi bulunmadığından **doğrulanamadı**; olumsuz AI çıkarımı olgu değildir.
+- Portföy hedefleri yapılandırılmadığından hedef ilerlemesi doğrulanamadı.
+- Gelecek ay: sonuç tarihleri, SEC başvuruları, sermaye artırımı riski, faiz ve enflasyon verilerini izleyin.
+{% endif %}
+
+## 10. Kaynaklar
+
+{% for source in report.market_sources %}
+- [{{ source.title }}]({{ source.url }}) — piyasa zamanı {{ source.published_at|dt }}, erişim {{ source.retrieved_at|dt }}, sağlayıcı {{ source.provider }}
+{% endfor %}
+{% for event in report.events %}
+- [{{ event.source.title }}]({{ event.source.url }}) — yayın {{ event.source.published_at|dt }}, erişim {{ event.source.retrieved_at|dt }}
+{% endfor %}
+{% for item in report.macro %}
+- [{{ item.source.title }}]({{ item.source.url }}) — gözlem {{ item.observed_at|dt }}, erişim {{ item.source.retrieved_at|dt }}
+{% endfor %}
+
+## AI yorumu durumu
+
+{% if report.ai_unavailable_reason %}AI yorumu kullanılamıyor: {{ report.ai_unavailable_reason }}{% else %}Şema ve kaynak doğrulamasından geçen AI yorumları yukarıda ayrı etiketlenmiştir.{% endif %}{{ "\n\n" -}}
+
+---
+
+**Uyarı:** Bu belge yalnızca bilgilendirme ve araştırma amaçlıdır; kişiselleştirilmiş yatırım tavsiyesi değildir. Alım, satım veya tutma talimatı içermez. Verileri birincil kaynaklardan ayrıca doğrulayın.

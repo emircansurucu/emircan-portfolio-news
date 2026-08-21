@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+reports/*.html
+reports/*.md
+!reports/.gitkeep
+data/state.json
+data/portfolio_history.jsonl
+data/processed_events.jsonl
+

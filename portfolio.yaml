@@ -1,0 +1,40 @@
+base_currency: TRY
+positions:
+  - symbol: MSFT
+    asset_type: stock
+    quantity: 1.0486
+    average_cost_usd: 389.79
+    unit: share
+  - symbol: RKLB
+    asset_type: stock
+    quantity: 1.8734
+    average_cost_usd: 72.06
+    unit: share
+  - symbol: ASTS
+    asset_type: stock
+    quantity: 0.9961
+    average_cost_usd: 100.39
+    unit: share
+  - symbol: VOO
+    asset_type: etf
+    quantity: 3.1528
+    average_cost_usd: 669.71
+    unit: share
+  - symbol: QQQM
+    asset_type: etf
+    quantity: 4.2802
+    average_cost_usd: 271.72
+    unit: share
+  - symbol: GOLD
+    asset_type: precious_metal
+    quantity: 9
+    unit: gram
+  - symbol: SILVER
+    asset_type: precious_metal
+    quantity: 400
+    unit: gram
+transactions: []
+benchmark_symbols:
+  - SP500
+  - NASDAQ100
+  - DXY
