@@ -103,6 +103,23 @@ Alış veya satış kaydı bulunan bir varlığın dönem katkısı, nakit harek
 Önceki başarılı çalışmadan sonra yeni ve doğrulanmış şirket duyurusu bulunmadı.
 {% endfor %}
 
+{% if report.late_analysis_events %}
+### Sonradan tamamlanan AI yorumları
+
+Bu olayların doğrulanmış bilgileri önceki bir raporda yayımlandı. Aşağıdaki AI yorumları bu çalıştırmada ilk kez tamamlanıp yayımlanmıştır.
+
+{% for event in report.late_analysis_events %}
+{% set analysis = report.analyses|selectattr("event_id", "equalto", event.event_id)|first %}
+#### {{ event.symbol }} — {{ event.title }}
+
+- **Sonradan tamamlanan AI yorumu:** {{ analysis.interpretation_tr }}
+- {{ analysis.possible_portfolio_relevance_tr }}
+- Önem / güven: {{ analysis.materiality }} / {{ analysis.confidence }}
+- Belirsizlikler: {{ analysis.uncertainties|join("; ") if analysis.uncertainties else "Belirtilmedi" }}
+- Önceden raporlanan olgunun kaynağı: [{{ event.source.title }}]({{ event.source.url }})
+{% endfor %}
+{% endif %}
+
 ## 5. Yeni SEC başvuruları
 
 {% for event in report.events if event.event_type == "filing" %}

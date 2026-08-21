@@ -185,6 +185,7 @@ class ReportContext(BaseModel):
     snapshot: PortfolioSnapshot | None = None
     events: list[MaterialEvent] = Field(default_factory=list)
     analyses: list[AIEventAnalysis] = Field(default_factory=list)
+    late_analysis_events: list[MaterialEvent] = Field(default_factory=list)
     analysis_dispositions: list[AnalysisDisposition] = Field(default_factory=list)
     macro: list[MacroObservation] = Field(default_factory=list)
     market_sources: list[SourceRecord] = Field(default_factory=list)

@@ -33,6 +33,10 @@ class StateRepository(Protocol):
 
     def pending_analysis_events(self) -> list[MaterialEvent]: ...
 
+    def completed_unreported_analyses(
+        self, cadence: Cadence
+    ) -> list[tuple[MaterialEvent, AIEventAnalysis]]: ...
+
     def record_discovered(self, events: list[MaterialEvent], at: datetime) -> None: ...
 
     def analysis_for(self, event: MaterialEvent) -> AIEventAnalysis | None: ...
@@ -56,11 +60,17 @@ class StateRepository(Protocol):
         report_id: str,
         snapshot: PortfolioSnapshot | None,
         events: list[MaterialEvent],
+        analysis_events: list[MaterialEvent],
         provider_checkpoints: dict[str, datetime],
     ) -> None: ...
 
     def enqueue_delivery(
-        self, report_id: str, text: str, event_ids: list[str], at: datetime
+        self,
+        report_id: str,
+        text: str,
+        event_ids: list[str],
+        analysis_event_ids: list[str],
+        at: datetime,
     ) -> None: ...
 
     def pending_deliveries(self, at: datetime) -> list[dict[str, Any]]: ...
@@ -91,7 +101,7 @@ class JsonStateRepository:
     @staticmethod
     def _default_state() -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": 3,
             "last_success": {},
             "provider_checkpoints": {},
             "processed_event_ids": [],
@@ -106,7 +116,33 @@ class JsonStateRepository:
         defaults = cls._default_state()
         for key, value in defaults.items():
             state.setdefault(key, value)
-        state["version"] = 2
+        lifecycle = state["event_lifecycle"]
+        for entry in lifecycle.values():
+            ai = entry.setdefault(
+                "ai",
+                {"status": "pending", "attempts": 0, "reported": {}, "deliveries": []},
+            )
+            ai.setdefault("reported", {})
+            ai.setdefault("deliveries", [])
+            if ai.get("status") == "completed" and ai.get("updated_at"):
+                ai_updated = datetime.fromisoformat(ai["updated_at"])
+                for cadence, factual_reported_at in entry.get("reported", {}).items():
+                    if cadence in ai["reported"]:
+                        continue
+                    factual_time = datetime.fromisoformat(
+                        factual_reported_at["reported_at"]
+                        if isinstance(factual_reported_at, dict)
+                        else factual_reported_at
+                    )
+                    if ai_updated <= factual_time:
+                        ai["reported"][cadence] = {
+                            "report_id": "legacy-inferred",
+                            "reported_at": factual_time.isoformat(),
+                            "migration_inferred": True,
+                        }
+        for item in state["outbox"]:
+            item.setdefault("analysis_event_ids", [])
+        state["version"] = 3
         return state
 
     def _state(self) -> dict[str, Any]:
@@ -226,6 +262,27 @@ class JsonStateRepository:
                 events.append(MaterialEvent.model_validate(row["event"]))
         return events
 
+    def completed_unreported_analyses(
+        self, cadence: Cadence
+    ) -> list[tuple[MaterialEvent, AIEventAnalysis]]:
+        state = self._state()
+        lifecycle = state["event_lifecycle"]
+        completed: list[tuple[MaterialEvent, AIEventAnalysis]] = []
+        for row in self._event_rows():
+            ai = lifecycle.get(row["fingerprint"], {}).get("ai", {})
+            if (
+                ai.get("status") == "completed"
+                and ai.get("analysis")
+                and cadence.value not in ai.get("reported", {})
+            ):
+                completed.append(
+                    (
+                        MaterialEvent.model_validate(row["event"]),
+                        AIEventAnalysis.model_validate(ai["analysis"]),
+                    )
+                )
+        return completed
+
     def record_discovered(self, events: list[MaterialEvent], at: datetime) -> None:
         if not events:
             return
@@ -241,7 +298,12 @@ class JsonStateRepository:
                     "event_id": event.event_id,
                     "discovered_at": at.isoformat(),
                     "reported": {},
-                    "ai": {"status": "pending", "attempts": 0},
+                    "ai": {
+                        "status": "pending",
+                        "attempts": 0,
+                        "reported": {},
+                        "deliveries": [],
+                    },
                     "deliveries": [],
                 },
             )
@@ -284,7 +346,12 @@ class JsonStateRepository:
                 "event_id": event.event_id,
                 "discovered_at": at.isoformat(),
                 "reported": {},
-                "ai": {"status": "pending", "attempts": 0},
+                "ai": {
+                    "status": "pending",
+                    "attempts": 0,
+                    "reported": {},
+                    "deliveries": [],
+                },
                 "deliveries": [],
             },
         )
@@ -294,6 +361,8 @@ class JsonStateRepository:
             "status": status,
             "attempts": attempts,
             "updated_at": at.isoformat(),
+            "reported": prior.get("reported", {}),
+            "deliveries": prior.get("deliveries", []),
         }
         if analysis is not None:
             ai_state["analysis"] = analysis.model_dump(mode="json")
@@ -309,6 +378,7 @@ class JsonStateRepository:
         report_id: str,
         snapshot: PortfolioSnapshot | None,
         events: list[MaterialEvent],
+        analysis_events: list[MaterialEvent] | None = None,
         provider_checkpoints: dict[str, datetime] | None = None,
     ) -> None:
         state = self._state()
@@ -325,12 +395,28 @@ class JsonStateRepository:
                     "event_id": event.event_id,
                     "discovered_at": at.isoformat(),
                     "reported": {},
-                    "ai": {"status": "pending", "attempts": 0},
+                    "ai": {
+                        "status": "pending",
+                        "attempts": 0,
+                        "reported": {},
+                        "deliveries": [],
+                    },
                     "deliveries": [],
                 },
             )
             entry["reported"][cadence.value] = at.isoformat()
         state["reported_event_ids"][cadence.value] = sorted(reported)
+        for event in analysis_events or []:
+            fingerprint = event_fingerprint(event)
+            entry = state["event_lifecycle"].get(fingerprint)
+            if entry is None or entry.get("ai", {}).get("status") != "completed":
+                raise RuntimeError(
+                    f"Tamamlanmamış AI analizi raporlandı olarak işaretlenemez: {event.event_id}"
+                )
+            entry["ai"].setdefault("reported", {})[cadence.value] = {
+                "report_id": report_id,
+                "reported_at": at.isoformat(),
+            }
         state["provider_checkpoints"].update(
             {
                 scope: timestamp.isoformat()
@@ -384,7 +470,12 @@ class JsonStateRepository:
         self._write_state(state)
 
     def enqueue_delivery(
-        self, report_id: str, text: str, event_ids: list[str], at: datetime
+        self,
+        report_id: str,
+        text: str,
+        event_ids: list[str],
+        analysis_event_ids: list[str] | None,
+        at: datetime,
     ) -> None:
         state = self._state()
         if any(item["report_id"] == report_id for item in state["outbox"]):
@@ -394,6 +485,7 @@ class JsonStateRepository:
                 "report_id": report_id,
                 "text": text,
                 "event_ids": event_ids,
+                "analysis_event_ids": analysis_event_ids or [],
                 "status": "pending",
                 "attempts": 0,
                 "created_at": at.isoformat(),
@@ -423,6 +515,12 @@ class JsonStateRepository:
                 lifecycle = state["event_lifecycle"].get(fingerprint)
                 if lifecycle is not None:
                     lifecycle.setdefault("deliveries", []).append(
+                        {"report_id": report_id, "delivered_at": at.isoformat()}
+                    )
+            for fingerprint in item.get("analysis_event_ids", []):
+                lifecycle = state["event_lifecycle"].get(fingerprint)
+                if lifecycle is not None:
+                    lifecycle.setdefault("ai", {}).setdefault("deliveries", []).append(
                         {"report_id": report_id, "delivered_at": at.isoformat()}
                     )
         else:

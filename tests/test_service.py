@@ -9,7 +9,7 @@ from investment_agent.models import AIEventAnalysis, Cadence, MaterialEvent, Sou
 from investment_agent.providers.base import ProviderResult
 from investment_agent.reporting import ReportRenderer
 from investment_agent.service import InvestmentAgent
-from investment_agent.state import JsonStateRepository
+from investment_agent.state import JsonStateRepository, event_fingerprint
 from tests.conftest import make_quote
 
 
@@ -267,6 +267,17 @@ async def test_ai_cap_bounded_concurrency_and_deferred_state(tmp_path, portfolio
     assert llm.max_active <= 2
     assert sum(runner.state.analysis_state(item) == "deferred" for item in events) == 2
 
+    second = await runner.run(Cadence.WEEKLY, now=NOW.replace(day=21))
+    second_report = (tmp_path / "reports" / f"{second.report_id}.md").read_text(encoding="utf-8")
+    assert llm.calls == 12
+    assert second_report.count("**Sonradan tamamlanan AI yorumu:**") == 2
+    assert all(runner.state.analysis_state(item) == "completed" for item in events)
+
+    third = await runner.run(Cadence.WEEKLY, now=NOW.replace(day=22))
+    third_report = (tmp_path / "reports" / f"{third.report_id}.md").read_text(encoding="utf-8")
+    assert llm.calls == 12
+    assert "**Sonradan tamamlanan AI yorumu:**" not in third_report
+
 
 @pytest.mark.asyncio
 async def test_failed_ai_analysis_remains_retryable(tmp_path, portfolio):
@@ -281,11 +292,55 @@ async def test_failed_ai_analysis_remains_retryable(tmp_path, portfolio):
         llm_retry_attempts=2,
         llm_retry_backoff_seconds=0,
     )
-    await runner.run(Cadence.WEEKLY, now=NOW)
+    first = await runner.run(Cadence.WEEKLY, now=NOW)
     assert runner.state.analysis_state(item) == "failed"
+    first_report = (tmp_path / "reports" / f"{first.report_id}.md").read_text(encoding="utf-8")
+    assert "Event 20" in first_report
+    assert "**Sonradan tamamlanan AI yorumu:**" not in first_report
+
     runner.llm = FlakyLLM(failures=0)
-    await runner.run(Cadence.WEEKLY, now=NOW.replace(day=21))
+    second = await runner.run(Cadence.WEEKLY, now=NOW.replace(day=21))
     assert runner.state.analysis_state(item) == "completed"
+    second_report = (tmp_path / "reports" / f"{second.report_id}.md").read_text(encoding="utf-8")
+    second_html = (tmp_path / "reports" / f"{second.report_id}.html").read_text(encoding="utf-8")
+    assert "**Sonradan tamamlanan AI yorumu:** AI yorumu: Etki belirsiz." in second_report
+    assert "Sonradan tamamlanan AI yorumu" in second_html
+    lifecycle = runner.state._state()["event_lifecycle"][event_fingerprint(item)]
+    assert lifecycle["ai"]["reported"]["weekly"]["report_id"] == second.report_id
+
+    third = await runner.run(Cadence.WEEKLY, now=NOW.replace(day=22))
+    third_report = (tmp_path / "reports" / f"{third.report_id}.md").read_text(encoding="utf-8")
+    third_html = (tmp_path / "reports" / f"{third.report_id}.html").read_text(encoding="utf-8")
+    assert "**Sonradan tamamlanan AI yorumu:**" not in third_report
+    assert "Sonradan tamamlanan AI yorumu" not in third_html
+
+
+@pytest.mark.asyncio
+async def test_analysis_completed_after_llm_configuration_is_published_once(tmp_path, portfolio):
+    item = material_event(21)
+    runner = event_agent(
+        tmp_path,
+        portfolio,
+        sec=SecBatch(),
+        news=NewsBatch([item]),
+        llm=None,
+    )
+    first = await runner.run(Cadence.WEEKLY, now=NOW)
+    first_report = (tmp_path / "reports" / f"{first.report_id}.md").read_text(encoding="utf-8")
+    assert "Event 21" in first_report
+    assert runner.state.analysis_state(item) == "pending"
+
+    llm = FlakyLLM(failures=0)
+    runner.llm = llm
+    second = await runner.run(Cadence.WEEKLY, now=NOW.replace(day=21))
+    second_report = (tmp_path / "reports" / f"{second.report_id}.md").read_text(encoding="utf-8")
+    assert llm.calls == 1
+    assert "**Sonradan tamamlanan AI yorumu:** AI yorumu: Etki belirsiz." in second_report
+
+    third = await runner.run(Cadence.WEEKLY, now=NOW.replace(day=22))
+    third_report = (tmp_path / "reports" / f"{third.report_id}.md").read_text(encoding="utf-8")
+    assert llm.calls == 1
+    assert "**Sonradan tamamlanan AI yorumu:**" not in third_report
 
 
 class FlakyDelivery:
@@ -321,6 +376,76 @@ async def test_delivery_outbox_retries_on_later_run(tmp_path, portfolio):
     old = next(item for item in outbox if item["report_id"] == first.report_id)
     assert old["status"] == "delivered"
     assert delivery.calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_late_analysis_telegram_delivery_is_retryable(tmp_path, portfolio):
+    item = material_event(30)
+    delivery = FlakyDelivery()
+    delivery.fail = False
+    runner = event_agent(
+        tmp_path,
+        portfolio,
+        sec=SecBatch(),
+        news=NewsBatch([item]),
+        llm=FlakyLLM(failures=100),
+        delivery=delivery,
+        llm_retry_attempts=1,
+        llm_retry_backoff_seconds=0,
+    )
+    await runner.run(Cadence.WEEKLY, now=NOW)
+
+    runner.llm = FlakyLLM(failures=0)
+    delivery.fail = True
+    second_at = NOW.replace(day=21)
+    second = await runner.run(Cadence.WEEKLY, now=second_at)
+    outbox = runner.state._state()["outbox"]
+    late_item = next(entry for entry in outbox if entry["report_id"] == second.report_id)
+    fingerprint = event_fingerprint(item)
+    assert "Sonradan tamamlanan AI yorumu" in late_item["text"]
+    assert late_item["analysis_event_ids"] == [fingerprint]
+    assert late_item["status"] == "failed"
+    lifecycle = runner.state._state()["event_lifecycle"][fingerprint]
+    assert lifecycle["ai"]["deliveries"] == []
+
+    delivery.fail = False
+    third_at = second_at.replace(minute=3)
+    third = await runner.run(Cadence.WEEKLY, now=third_at)
+    third_report = (tmp_path / "reports" / f"{third.report_id}.md").read_text(encoding="utf-8")
+    outbox = runner.state._state()["outbox"]
+    late_item = next(entry for entry in outbox if entry["report_id"] == second.report_id)
+    lifecycle = runner.state._state()["event_lifecycle"][fingerprint]
+    assert late_item["status"] == "delivered"
+    assert lifecycle["ai"]["deliveries"] == [
+        {"report_id": second.report_id, "delivered_at": third_at.isoformat()}
+    ]
+    assert "**Sonradan tamamlanan AI yorumu:**" not in third_report
+
+
+@pytest.mark.asyncio
+async def test_dry_run_does_not_modify_late_analysis_lifecycle(tmp_path, portfolio):
+    item = material_event(40)
+    runner = event_agent(
+        tmp_path,
+        portfolio,
+        sec=SecBatch(),
+        news=NewsBatch([item]),
+        llm=FlakyLLM(failures=0),
+    )
+    runner.state.record_discovered([item], NOW)
+    runner.state.mark_analysis(item, "failed", NOW, reason="temporary")
+    runner.state.commit_success(Cadence.WEEKLY, NOW, "weekly-existing", None, [item])
+    state_before = runner.state.state_path.read_bytes()
+    events_before = runner.state.events_path.read_bytes()
+
+    result = await runner.run(Cadence.WEEKLY, dry_run=True, now=NOW.replace(day=21))
+    report = (tmp_path / "reports" / f"{result.report_id}.md").read_text(encoding="utf-8")
+    assert "**Sonradan tamamlanan AI yorumu:** AI yorumu: Etki belirsiz." in report
+    assert runner.state.state_path.read_bytes() == state_before
+    assert runner.state.events_path.read_bytes() == events_before
+    lifecycle = runner.state._state()["event_lifecycle"][event_fingerprint(item)]
+    assert lifecycle["ai"]["status"] == "failed"
+    assert lifecycle["ai"]["reported"] == {}
 
 
 @pytest.mark.asyncio

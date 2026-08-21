@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 from investment_agent.models import (
@@ -107,9 +108,15 @@ def test_event_lifecycle_and_retryable_outbox_are_separate(tmp_path, now):
     assert repository.analysis_for(item) is not None
     assert not repository.is_processed(item, Cadence.DAILY)
 
-    repository.commit_success(Cadence.DAILY, now, "daily-1", None, [item])
+    repository.commit_success(Cadence.DAILY, now, "daily-1", None, [item], [item])
     assert repository.is_processed(item, Cadence.DAILY)
-    repository.enqueue_delivery("daily-1", "message", [event_fingerprint(item)], now)
+    repository.enqueue_delivery(
+        "daily-1",
+        "message",
+        [event_fingerprint(item)],
+        [event_fingerprint(item)],
+        now,
+    )
     assert len(repository.pending_deliveries(now)) == 1
     repository.mark_delivery("daily-1", success=False, at=now, error="offline")
     assert repository.pending_deliveries(now) == []
@@ -121,6 +128,8 @@ def test_event_lifecycle_and_retryable_outbox_are_separate(tmp_path, now):
     assert lifecycle["discovered_at"]
     assert lifecycle["reported"]["daily"]
     assert lifecycle["ai"]["status"] == "completed"
+    assert lifecycle["ai"]["reported"]["daily"]["report_id"] == "daily-1"
+    assert lifecycle["ai"]["deliveries"][0]["report_id"] == "daily-1"
     assert lifecycle["deliveries"][0]["report_id"] == "daily-1"
 
 
@@ -131,3 +140,58 @@ def test_state_recovers_from_last_known_good_backup(tmp_path, now):
     repository.commit_success(Cadence.DAILY, later, "second", None, [])
     repository.state_path.write_text("{broken", encoding="utf-8")
     assert repository.last_success(Cadence.DAILY) == now
+
+
+def test_v2_migration_infers_only_analyses_already_in_factual_reports(tmp_path, now):
+    already_published = JsonStateRepository(tmp_path / "already-published")
+    item = event(now)
+    already_published.record_discovered([item], now)
+    already_published.mark_analysis(item, "completed", now, analysis=analysis(item))
+    factual_report_at = now + timedelta(minutes=1)
+    already_published.commit_success(
+        Cadence.DAILY,
+        factual_report_at,
+        "legacy-daily",
+        None,
+        [item],
+    )
+    legacy = json.loads(already_published.state_path.read_text(encoding="utf-8"))
+    legacy["version"] = 2
+    legacy_ai = legacy["event_lifecycle"][event_fingerprint(item)]["ai"]
+    legacy_ai.pop("reported")
+    legacy_ai.pop("deliveries")
+    already_published.state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    migrated = already_published._state()
+    migrated_ai = migrated["event_lifecycle"][event_fingerprint(item)]["ai"]
+    assert migrated["version"] == 3
+    assert migrated_ai["reported"]["daily"] == {
+        "report_id": "legacy-inferred",
+        "reported_at": factual_report_at.isoformat(),
+        "migration_inferred": True,
+    }
+    assert migrated_ai["deliveries"] == []
+    assert already_published.completed_unreported_analyses(Cadence.DAILY) == []
+
+    completed_later = JsonStateRepository(tmp_path / "completed-later")
+    completed_later.record_discovered([item], now)
+    completed_later.commit_success(Cadence.DAILY, now, "legacy-daily", None, [item])
+    completed_later.mark_analysis(
+        item,
+        "completed",
+        factual_report_at,
+        analysis=analysis(item),
+    )
+    legacy = json.loads(completed_later.state_path.read_text(encoding="utf-8"))
+    legacy["version"] = 2
+    legacy_ai = legacy["event_lifecycle"][event_fingerprint(item)]["ai"]
+    legacy_ai.pop("reported")
+    legacy_ai.pop("deliveries")
+    completed_later.state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    migrated = completed_later._state()
+    migrated_ai = migrated["event_lifecycle"][event_fingerprint(item)]["ai"]
+    assert migrated_ai["reported"] == {}
+    assert migrated_ai["deliveries"] == []
+    pending_publications = completed_later.completed_unreported_analyses(Cadence.DAILY)
+    assert [pending.event_id for pending, _ in pending_publications] == [item.event_id]

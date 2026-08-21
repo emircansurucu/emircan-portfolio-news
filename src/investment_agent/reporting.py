@@ -169,8 +169,21 @@ def telegram_summary(context: ReportContext, report_reference: str) -> str:
                 f"Katkı: + {ranked[-1][0]} {ranked[-1][1]:+.2f} puan; "
                 f"- {ranked[0][0]} {ranked[0][1]:+.2f} puan"
             )
-    high = [analysis for analysis in context.analyses if analysis.materiality == "high"][:3]
+    late_ids = {event.event_id for event in context.late_analysis_events}
+    high = [
+        analysis
+        for analysis in context.analyses
+        if analysis.materiality == "high" and analysis.event_id not in late_ids
+    ][:3]
     lines.extend(f"• {item.symbol}: {item.fact_summary_tr}" for item in high)
+    for event in context.late_analysis_events:
+        analysis = next(
+            (item for item in context.analyses if item.event_id == event.event_id), None
+        )
+        if analysis is not None:
+            lines.append(
+                f"Sonradan tamamlanan AI yorumu — {event.symbol}: {analysis.interpretation_tr}"
+            )
     failures = [status.provider for status in context.providers if not status.success]
     if failures:
         lines.append("Uyarı — başarısız sağlayıcılar: " + ", ".join(failures))

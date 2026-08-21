@@ -211,6 +211,7 @@ class InvestmentAgent:
         analyses: list[AIEventAnalysis] = []
         dispositions: list[AnalysisDisposition] = []
         analysis_by_event: dict[str, AIEventAnalysis] = {}
+        newly_completed: dict[str, tuple[MaterialEvent, AIEventAnalysis]] = {}
         for event in all_events:
             saved = self.state.analysis_for(event)
             if saved is not None:
@@ -274,6 +275,7 @@ class InvestmentAgent:
                         self.state.mark_analysis(event, "failed", at_utc, reason=reason)
                 else:
                     analysis_by_event[event.event_id] = analysis
+                    newly_completed[event_fingerprint(event)] = (event, analysis)
                     if event in report_events:
                         dispositions.append(
                             AnalysisDisposition(
@@ -290,10 +292,20 @@ class InvestmentAgent:
             )
         else:
             statuses.append(ProviderStatus(provider=self.llm.name, success=True))
-        analyses = [
-            analysis_by_event[event.event_id]
-            for event in report_events
-            if event.event_id in analysis_by_event
+        publication_pairs = self.state.completed_unreported_analyses(cadence)
+        publication_by_fingerprint = {
+            event_fingerprint(event): (event, analysis) for event, analysis in publication_pairs
+        }
+        publication_by_fingerprint.update(newly_completed)
+        analysis_publication_events = [
+            event for event, _analysis in publication_by_fingerprint.values()
+        ]
+        analyses = [analysis for _event, analysis in publication_by_fingerprint.values()]
+        factual_fingerprints = {event_fingerprint(event) for event in report_events}
+        late_analysis_events = [
+            event
+            for fingerprint, (event, _analysis) in publication_by_fingerprint.items()
+            if fingerprint not in factual_fingerprints
         ]
 
         snapshot = None
@@ -456,6 +468,7 @@ class InvestmentAgent:
             snapshot=snapshot,
             events=report_events,
             analyses=analyses,
+            late_analysis_events=late_analysis_events,
             analysis_dispositions=dispositions,
             macro=macro_observations,
             market_sources=[quote.source for quote in quotes.values()],
@@ -476,6 +489,7 @@ class InvestmentAgent:
                 report_id,
                 snapshot,
                 report_events,
+                analysis_publication_events,
                 successful_checkpoints,
             )
             checkpoint_updated = True
@@ -491,6 +505,7 @@ class InvestmentAgent:
                 report_id,
                 telegram_summary(context, reference),
                 [event_fingerprint(event) for event in report_events],
+                [event_fingerprint(event) for event in analysis_publication_events],
                 at_utc,
             )
             for item in self.state.pending_deliveries(at_utc):
